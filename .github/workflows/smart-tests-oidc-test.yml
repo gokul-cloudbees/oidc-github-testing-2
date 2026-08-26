@@ -1,0 +1,103 @@
+name: Smart Tests OIDC test (AIENG-679)
+
+on:
+  workflow_dispatch:
+    inputs:
+      intake_url:
+        description: 'Public ngrok URL for your local Intake'
+        required: true
+        default: 'https://scheme-overprice-water.ngrok-free.dev'
+      organization:
+        description: 'Smart Tests organization'
+        required: true
+        default: 'launchableinc'
+      workspace:
+        description: 'Smart Tests workspace'
+        required: true
+        default: 'mothership'
+      mode:
+        description: 'Which OIDC path to exercise'
+        required: true
+        default: 'generic'
+        type: choice
+        options:
+          - generic  # SMART_TESTS_GITHUB_OIDC_TOKEN_AUTH — sends normal OIDC bearer
+          - legacy   # EXPERIMENTAL_GITHUB_OIDC_TOKEN_AUTH — sends GitHub-OIDC-Legacy header
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for GitHub Actions to mint an OIDC id-token
+
+    env:
+      SMART_TESTS_BASE_URL: ${{ inputs.intake_url }}
+      SMART_TESTS_ORGANIZATION: ${{ inputs.organization }}
+      SMART_TESTS_WORKSPACE: ${{ inputs.workspace }}
+      # Ngrok's free tier serves an interstitial HTML page by default. Skip it so the CLI's
+      # requests reach Intake, not the warning page.
+      SMART_TESTS_HTTP_HEADER_NGROK_SKIP_BROWSER_WARNING: 'true'
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install smart-tests CLI from AIENG-679 branch
+        run: |
+          python -m pip install --upgrade pip
+          # Install directly from the branch under test.
+          pip install "git+https://github.com/cloudbees-oss/smart-tests-cli.git@AIENG-679"
+          smart-tests --version || true
+          smart-tests --help | head -30
+
+      - name: Show which OIDC path this run exercises
+        run: |
+          echo "Mode: ${{ inputs.mode }}"
+          echo "Intake: $SMART_TESTS_BASE_URL"
+          echo "Org/WS: $SMART_TESTS_ORGANIZATION / $SMART_TESTS_WORKSPACE"
+
+      # ---------- GENERIC PATH ----------
+      # Intake routes to verifyOidcJWT and matches the normalized `repo:OWNER/REPO` subject
+      # against trusted_oidc_subjects. The CLI fetches the id-token with audience=Smart Tests
+      # so the generic path's aud check passes.
+      - name: Verify — generic GitHub OIDC
+        if: inputs.mode == 'generic'
+        env:
+          SMART_TESTS_GITHUB_OIDC_TOKEN_AUTH: '1'
+        run: |
+          set -x
+          smart-tests verify || true
+          # Try an actual API call so the bearer is exercised on a workspace-scoped endpoint.
+          smart-tests record build --name "oidc-generic-$GITHUB_RUN_ID" || true
+
+      # ---------- LEGACY PATH ----------
+      # CLI adds GitHub-OIDC-Legacy: 1. Intake routes to the deprecated verifyGitHubJWT and
+      # matches the `repository` claim against trusted_github_repositories.
+      - name: Verify — legacy GitHub OIDC
+        if: inputs.mode == 'legacy'
+        env:
+          EXPERIMENTAL_GITHUB_OIDC_TOKEN_AUTH: '1'
+        run: |
+          set -x
+          smart-tests verify || true
+          smart-tests record build --name "oidc-legacy-$GITHUB_RUN_ID" || true
+
+      # ---------- DEBUG: raw curl with the id-token ----------
+      # Useful when Intake rejects the token — this shows the exact response body.
+      - name: Debug — call /intake/oidc/verify directly (generic)
+        if: inputs.mode == 'generic'
+        run: |
+          ID_TOKEN=$(curl -sSL \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            -H "Accept: application/json; api-version=2.0" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://app.cloudbees.io/smart-tests" | jq -r .value)
+          echo "--- token header/payload (base64url) ---"
+          echo "$ID_TOKEN" | cut -d. -f1 | base64 -d 2>/dev/null || true; echo
+          echo "$ID_TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null || true; echo
+          echo "--- POST /intake/oidc/verify ---"
+          curl -sSi -X POST "$SMART_TESTS_BASE_URL/intake/oidc/verify" \
+            -H "Authorization: Bearer $ID_TOKEN" \
+            -H "ngrok-skip-browser-warning: true"
