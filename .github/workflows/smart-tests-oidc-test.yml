@@ -18,11 +18,12 @@ on:
       mode:
         description: 'Which OIDC path to exercise'
         required: true
-        default: 'generic'
+        default: 'verify-oidc'
         type: choice
         options:
-          - generic  # SMART_TESTS_GITHUB_OIDC_TOKEN_AUTH — sends normal OIDC bearer
-          - legacy   # EXPERIMENTAL_GITHUB_OIDC_TOKEN_AUTH — sends GitHub-OIDC-Legacy header
+          - verify-oidc  # `smart-tests verify --oidc` bootstrap (per docs) — 403 prints sub, 200 exports org/ws
+          - generic      # SMART_TESTS_GITHUB_OIDC_TOKEN_AUTH — sends normal OIDC bearer on every call
+          - legacy       # EXPERIMENTAL_GITHUB_OIDC_TOKEN_AUTH — sends GitHub-OIDC-Legacy header
 
 jobs:
   verify:
@@ -58,6 +59,57 @@ jobs:
           echo "Mode: ${{ inputs.mode }}"
           echo "Intake: $SMART_TESTS_BASE_URL"
           echo "Org/WS: $SMART_TESTS_ORGANIZATION / $SMART_TESTS_WORKSPACE"
+
+      # ---------- verify --oidc BOOTSTRAP (per docs) ----------
+      # Docs: put an OIDC id-token into SMART_TESTS_OIDC_TOKEN, then `eval "$(smart-tests verify --oidc)"`.
+      # On 403 the CLI prints an {"issuer","normalized-sub"} block to paste into Settings.
+      # On 200 it exports SMART_TESTS_ORGANIZATION / SMART_TESTS_WORKSPACE / SMART_TESTS_OIDC_TOKEN,
+      # and every subsequent smart-tests call authenticates automatically.
+      - name: Verify — verify --oidc bootstrap
+        if: inputs.mode == 'verify-oidc'
+        # Do NOT set SMART_TESTS_ORGANIZATION/SMART_TESTS_WORKSPACE here — the whole point of the
+        # bootstrap is that verify --oidc discovers them from the token.
+        env:
+          SMART_TESTS_ORGANIZATION: ''
+          SMART_TESTS_WORKSPACE: ''
+        run: |
+          set -eo pipefail
+
+          # 1. Fetch a GitHub Actions id-token minted for the Smart Tests audience so the generic
+          #    OIDC path's aud check passes.
+          ID_TOKEN=$(curl -sSL \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            -H "Accept: application/json; api-version=2.0" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://app.cloudbees.io/smart-tests" \
+            | jq -r .value)
+          export SMART_TESTS_OIDC_TOKEN="$ID_TOKEN"
+
+          echo "--- token payload (claims) ---"
+          echo "$ID_TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq . || true
+
+          # 2. Bootstrap. On 200 this prints eval-able exports to stdout and a success line to
+          #    stderr; on 403 it prints the register-me block and exits non-zero.
+          echo "--- smart-tests verify --oidc ---"
+          set +e
+          VERIFY_STDOUT=$(smart-tests verify --oidc)
+          VERIFY_RC=$?
+          set -e
+          echo "$VERIFY_STDOUT"
+          echo "verify --oidc exit code: $VERIFY_RC"
+
+          if [ "$VERIFY_RC" -ne 0 ]; then
+            echo "::warning::verify --oidc failed. If a 403 register-me block was printed above,"
+            echo "::warning::paste it in Settings → Trusted OIDC subjects and re-run this workflow."
+            exit 1
+          fi
+
+          # 3. Load the exported org/ws/token into the shell (this is the `eval` step from the docs).
+          eval "$VERIFY_STDOUT"
+          echo "Post-bootstrap: org=$SMART_TESTS_ORGANIZATION ws=$SMART_TESTS_WORKSPACE"
+
+          # 4. A follow-up call — proves the same OIDC token authenticates on a workspace-scoped
+          #    endpoint (RESTAuthVerifier.verifyOidcJWT path).
+          smart-tests record build --name "verify-oidc-$GITHUB_RUN_ID"
 
       # ---------- GENERIC PATH ----------
       # Intake routes to verifyOidcJWT and matches the normalized `repo:OWNER/REPO` subject
