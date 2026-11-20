@@ -46,11 +46,11 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Install smart-tests CLI from AIENG-679 branch
+      - name: Install smart-tests CLI from main branch
         run: |
           python -m pip install --upgrade pip
           # Install directly from the branch under test.
-          pip install "git+https://github.com/cloudbees-oss/smart-tests-cli.git@AIENG-679"
+          pip install "git+https://github.com/cloudbees-oss/smart-tests-cli.git"
           smart-tests --version || true
           smart-tests --help | head -30
 
