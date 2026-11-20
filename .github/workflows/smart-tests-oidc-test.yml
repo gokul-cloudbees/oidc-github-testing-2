@@ -60,6 +60,31 @@ jobs:
           echo "Intake: $SMART_TESTS_BASE_URL"
           echo "Org/WS: $SMART_TESTS_ORGANIZATION / $SMART_TESTS_WORKSPACE"
 
+      # ---------- DEBUG: which repo form does GitHub put in each claim? ----------                                                                                                                                                                                                                              
+      # Legacy auth (verifyGitHubJWT) matches ONLY the `repository` claim against                                                                                                                                                                                                                                
+      # trusted_github_repositories.owner_name + "/" + repository_name, exact string match.                                                                                                                                                                                                                      
+     # The generic path matches `sub`. This step shows both so we know what to store.                                                                                                                                                                                                                           
+      - name: Debug — dump repo-related OIDC claims
+        run: |
+            set -eo pipefail
+            ID_TOKEN=$(curl -sSL \
+              -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              -H "Accept: application/json; api-version=2.0" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://app.cloudbees.io/smart-tests" \
+              | jq -r .value)
+            # JWT payload is base64url WITHOUT padding: translate the alphabet and re-pad,
+            # otherwise `base64 -d` fails and the `|| true` above silently hides it.
+            PAYLOAD=$(echo "$ID_TOKEN" | cut -d. -f2 | tr '_-' '/+')
+            while [ $(( ${#PAYLOAD} % 4 )) -ne 0 ]; do PAYLOAD="${PAYLOAD}="; done
+            CLAIMS=$(echo "$PAYLOAD" | base64 -d)
+
+            echo "$CLAIMS" | jq '{sub, repository, repository_owner, repository_id, repository_owner_id}'
+            REPO_CLAIM=$(echo "$CLAIMS" | jq -r .repository)
+            if [[ "$REPO_CLAIM" == *@* ]]; then
+              echo "::notice::repository claim CONTAINS @id -> store owner/repo WITH @id in trusted_github_repositories"
+            else
+              echo "::notice::repository claim is name-only -> store owner/repo WITHOUT @id"
+            fi
       # ---------- verify --oidc BOOTSTRAP (per docs) ----------
       # Docs: put an OIDC id-token into SMART_TESTS_OIDC_TOKEN, then `eval "$(smart-tests verify --oidc)"`.
       # On 403 the CLI prints an {"issuer","normalized-sub"} block to paste into Settings.
